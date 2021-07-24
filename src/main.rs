@@ -1,14 +1,7 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::Ipv4Addr;
 
 mod tcp;
-
-#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
-struct Quad {
-    src: (Ipv4Addr, u16),
-    dst: (Ipv4Addr, u16),
-}
 
 fn main() -> io::Result<()> {
     let mut connections: HashMap<Quad, tcp::Connection> = Default::default();

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 
 enum State {
@@ -26,6 +27,9 @@ pub struct Connection {
     recv: RecvSequenceSpace,
     ip: etherparse::Ipv4Header,
     tcp: etherparse::TcpHeader,
+
+    pub(crate) incoming: VecDeque<u8>,
+    pub(crate) unacked: VecDeque<u8>,
 }
 
 /// State of Send Sequence Space (RFC 793 S3.2 Figure 4)
@@ -97,7 +101,7 @@ impl Connection {
         tcph: etherparse::TcpHeaderSlice<'a>,
         data: &'a [u8],
     ) -> io::Result<Option<Self>> {
-        let mut buf = [0u8; 1500];
+        let buf = [0u8; 1500];
         if !tcph.syn() {
             // only expected SYN package
             return Ok(None);
@@ -142,6 +146,8 @@ impl Connection {
                 ],
             ),
             tcp: etherparse::TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, wnd),
+            incoming: Default::default(),
+            unacked: Default::default(),
         };
 
         // need to start establishing a connection
