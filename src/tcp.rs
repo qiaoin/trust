@@ -1,6 +1,15 @@
+use bitflags::bitflags;
 use std::collections::VecDeque;
 use std::io;
 
+bitflags! {
+    pub(crate) struct Available: u8 {
+        const READ = 0b00000001;
+        const WRITE = 0b00000010;
+    }
+}
+
+#[derive(Debug)]
 enum State {
     // Closed,
     // Listen,
@@ -30,6 +39,34 @@ pub struct Connection {
 
     pub(crate) incoming: VecDeque<u8>,
     pub(crate) unacked: VecDeque<u8>,
+}
+
+impl Connection {
+    pub(crate) fn is_rcv_closed(&self) -> bool {
+        eprintln!("ask if closed when in {:?}", self.state);
+        if let State::TimeWait = self.state {
+            // TODO: any state after rcvd FIN, so also CLOSE-WAIT, LAST-ACK, CLOSED, CLOSING
+            true
+        } else {
+            false
+        }
+    }
+
+    fn availability(&self) -> Available {
+        let mut a = Available::empty();
+        eprintln!(
+            "computing availability, where {:?}, {:?}",
+            self.is_rcv_closed(),
+            self.incoming.is_empty()
+        );
+        if self.is_rcv_closed() || !self.incoming.is_empty() {
+            a |= Available::READ;
+        }
+
+        // TODO: take into account self.state
+        // TODO: set Available::WRITE
+        a
+    }
 }
 
 /// State of Send Sequence Space (RFC 793 S3.2 Figure 4)
@@ -222,13 +259,13 @@ impl Connection {
         Ok(())
     }
 
-    pub fn on_packet<'a>(
+    pub(crate) fn on_packet<'a>(
         &mut self,
         nic: &mut tun_tap::Iface,
         iph: etherparse::Ipv4HeaderSlice<'a>,
         tcph: etherparse::TcpHeaderSlice<'a>,
         data: &'a [u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Available> {
         // first, check that sequence numbers are valid (RFC 793 S3.3)
         //
         // valid segment check. okey if it acks at least one byte, which means that at least
@@ -242,18 +279,22 @@ impl Connection {
             slen += 1;
         }
         let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
-        if slen == 0 {
+        let okay = if slen == 0 {
             // zero-length segment has separate rules for acceptance
             if self.recv.wnd == 0 {
                 if seqn != self.recv.nxt {
-                    return Ok(());
+                    false
+                } else {
+                    true
                 }
             } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend) {
-                return Ok(());
+                false
+            } else {
+                true
             }
         } else {
             if self.recv.wnd == 0 {
-                return Ok(());
+                false
             } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
                 && !is_between_wrapped(
                     self.recv.nxt.wrapping_sub(1),
@@ -261,8 +302,16 @@ impl Connection {
                     wend,
                 )
             {
-                return Ok(());
+                false
+            } else {
+                true
             }
+        };
+
+        if !okay {
+            eprintln!("NOT OKAY");
+            self.write(nic, &[])?;
+            return Ok(self.availability());
         }
 
         self.recv.nxt = seqn.wrapping_add(slen);
@@ -273,7 +322,8 @@ impl Connection {
         // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 
         if !tcph.ack() {
-            return Ok(());
+            eprintln!("NOT ACK");
+            return Ok(self.availability());
         }
 
         let ackn = tcph.acknowledgment_number();
@@ -292,15 +342,16 @@ impl Connection {
         }
 
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
-            if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+            if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
                 // if !self.state.is_synchronized() {
                 //     // RFC 793 S3.4 Page 35
                 //     // according to Reset Generation, we should send a RST
                 //     self.send_rst(nic)?;
                 // }
-                return Ok(());
+                self.send.una = ackn;
             }
-            self.send.una = ackn;
+
+            // TODO: accept data
             assert!(data.is_empty());
 
             if let State::Estab = self.state {
@@ -323,6 +374,7 @@ impl Connection {
         }
 
         if tcph.fin() {
+            eprintln!("IS FIN (in {:?})", self.state);
             if let State::FinWait2 = self.state {
                 // we're done with the connection!
                 if !tcph.fin() && !data.is_empty() {
@@ -334,7 +386,7 @@ impl Connection {
             }
         }
 
-        Ok(())
+        Ok(self.availability())
     }
 }
 
