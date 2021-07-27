@@ -314,7 +314,6 @@ impl Connection {
             return Ok(self.availability());
         }
 
-        self.recv.nxt = seqn.wrapping_add(slen);
         // TODO: make sure this get acked
 
         // RFC 793 Page 68 SEGMENT ARRIVES
@@ -323,6 +322,11 @@ impl Connection {
 
         if !tcph.ack() {
             eprintln!("NOT ACK");
+            if tcph.syn() {
+                // got SYN part of initial handshake
+                assert!(data.is_empty());
+                self.recv.nxt = seqn.wrapping_add(1);
+            }
             return Ok(self.availability());
         }
 
@@ -350,15 +354,15 @@ impl Connection {
                 // }
                 self.send.una = ackn;
             }
+            // TODO: prune self.unacked
+            // TODO: if self.unacked is empty, and wait flush, notify
+            // TODO: update window
 
-            // TODO: accept data
-            assert!(data.is_empty());
-
+            // FIXME: we don't support Write yet, so immediately send EOF
             if let State::Estab = self.state {
-                // now, let's terminate the connection
                 // TODO: needs to be store in the retransmission queue!
                 self.tcp.fin = true;
-                self.write(nic, &[])?;
+                // self.write(nic, &[])?;
                 self.state = State::FinWait1;
             }
         }
@@ -371,6 +375,29 @@ impl Connection {
                 // and we have only sent only one byte (the FIN)
                 self.state = State::FinWait2;
             }
+        }
+
+        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+            // TODO: only read stuff we haven't read
+            let mut unread_data_at = (self.recv.nxt - seqn) as usize;
+            if unread_data_at > data.len() {
+                // we must have received a re-transmitted FIN that we have already seen,
+                // nxt points to beyond the FIN, but the FIN is not in data!
+                assert_eq!(unread_data_at, data.len() + 1);
+                unread_data_at = 0;
+            }
+            self.incoming.extend(&data[unread_data_at..]);
+
+            // Once the TCP takes responsibility for the data it advances
+            // RCV.NXT over the data accepted, and adjusts RCV.WND as
+            // apporopriate to the current buffer availability.  The total of
+            // RCV.NXT and RCV.WND should not be reduced.
+            self.recv.nxt = seqn
+                .wrapping_add(data.len() as u32)
+                .wrapping_add(if tcph.fin() { 1 } else { 0 });
+
+            // Send an acknowledgment of the form: <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+            self.write(nic, &[])?;
         }
 
         if tcph.fin() {
