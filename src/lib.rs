@@ -61,7 +61,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
             nic.as_raw_fd(),
             nix::poll::PollFlags::POLLIN,
         )];
-        let n = nix::poll::poll(&mut pfd[..], 1).map_err(|e| e.as_errno().unwrap())?;
+        let n = nix::poll::poll(&mut pfd[..], 10).map_err(|e| e.as_errno().unwrap())?;
         assert_ne!(n, -1);
         if n == 0 {
             // TODO: timed out -- do something with timers
