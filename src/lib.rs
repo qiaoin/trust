@@ -54,7 +54,25 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
     let mut buf = [0u8; 1504];
 
     loop {
-        // TODO: set a timeout for this recv for TCP timers or ConnectionManager::terminate
+        // we want to read from nic, but we want to make sure that we'll wake up when the next timer
+        // has to be triggered!
+        use std::os::unix::io::AsRawFd;
+        let mut pfd = [nix::poll::PollFd::new(
+            nic.as_raw_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        let n = nix::poll::poll(&mut pfd[..], 1).map_err(|e| e.as_errno().unwrap())?;
+        assert_ne!(n, -1);
+        if n == 0 {
+            // TODO: timed out -- do something with timers
+            let mut cmg = ih.manager.lock().unwrap();
+            for connection in cmg.connections.values_mut() {
+                // TODO: don't die on errors?
+                connection.on_tick(&mut nic)?;
+            }
+            continue;
+        }
+        assert_eq!(n, 1);
         let nbytes = nic.recv(&mut buf[..])?;
 
         // TODO: if self.ternimate && Arc.get_strong_refs(ih) == 1
@@ -85,7 +103,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
                         // eth_flags + eth_proto + ip_header + tcp_header
                         let datai = iph.slice().len() + tcph.slice().len();
                         let mut cmg = ih.manager.lock().unwrap();
-                        let mut cm = &mut *cmg;
+                        let cm = &mut *cmg;
                         let q = Quad {
                             src: (src, tcph.source_port()),
                             dst: (dst, tcph.destination_port()),
@@ -229,7 +247,7 @@ pub struct TcpStream {
 
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let mut cm = self.h.manager.lock().unwrap();
+        let cm = self.h.manager.lock().unwrap();
         // TODO: send FIN on cm.connections[quad]
         // TODO: _eventually_ remove self.quad from cm.connections
     }
@@ -326,6 +344,11 @@ impl Write for TcpStream {
 impl TcpStream {
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
         // TODO: send FIN on cm.connections[quad]
-        unimplemented!()
+        let mut cm = self.h.manager.lock().unwrap();
+        let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::ConnectionAborted, "stream was terminated unexpectedly")
+        })?;
+
+        c.close()
     }
 }

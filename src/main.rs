@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Write};
 use std::io::Read;
 use std::thread;
 
@@ -10,6 +10,8 @@ fn main() -> io::Result<()> {
     let jh1 = thread::spawn(move || {
         while let Ok(mut stream) = l1.accept() {
             eprintln!("got connection on 9000!");
+            stream.write(b"hello").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
             loop {
                 let mut buf = [0u8; 512];
                 let n = stream.read(&mut buf[..]).unwrap();
