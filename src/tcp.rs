@@ -12,6 +12,8 @@ bitflags! {
 }
 
 #[derive(Debug)]
+/// 包含的状态都为被动打开（passive OPEN），也就是 server 端状态
+/// 主动打开（active open）使用 nc/curl 来进行模拟测试，作为 client 端
 enum State {
     // Closed,
     // Listen,
@@ -23,6 +25,7 @@ enum State {
 }
 
 impl State {
+    // (RFC 793 Page 32) 在 RESET 的时候使用，目前未实现 RESET
     fn is_synchronized(&self) -> bool {
         match *self {
             State::SynRcvd => false,
@@ -33,17 +36,27 @@ impl State {
 
 // Transmission Control Block
 pub struct Connection {
+    ///
     state: State,
+    ///
     send: SendSequenceSpace,
+    ///
     recv: RecvSequenceSpace,
+    ///
     ip: etherparse::Ipv4Header,
+    ///
     tcp: etherparse::TcpHeader,
+    ///
     timers: Timers,
 
+    ///
     pub(crate) incoming: VecDeque<u8>,
+    ///
     pub(crate) unacked: VecDeque<u8>,
 
+    ///
     pub(crate) closed: bool,
+    ///
     closed_at: Option<u32>,
 }
 
@@ -80,7 +93,7 @@ impl Connection {
     }
 }
 
-/// State of Send Sequence Space (RFC 793 S3.2 Figure 4)
+/// State of Send Sequence Space (RFC 793 S3.2 Figure 4 Page 20)
 /// ```
 ///      1         2          3          4
 /// ----------|----------|----------|----------
@@ -109,7 +122,7 @@ struct SendSequenceSpace {
     iss: u32,
 }
 
-/// State of Receive Sequence Space (RFC 793 S3.2 Figure 5)
+/// State of Receive Sequence Space (RFC 793 S3.2 Figure 5 Page 20)
 /// ```
 ///      1          2          3
 /// ----------|----------|----------
@@ -131,30 +144,25 @@ struct RecvSequenceSpace {
     irs: u32,
 }
 
-// 对于不同的状态，有不同的表现，因此就没有 Default
-// impl Default for Connection {
-//     fn default() -> Self {
-//         // State::Closed
-//         Connection {
-//             state: State::Listen,
-//         }
-//     }
-// }
-
 impl Connection {
-    // 前置条件：Listen State
+    /// server 已启动，处于 Listen State，Client 发起连接，API 等同 Unix Socket 接口
+    ///
+    /// Unix Socket 接口
+    ///
+    /// 前置条件：Listen State
     pub fn accept<'a>(
         nic: &mut tun_tap::Iface,
         iph: etherparse::Ipv4HeaderSlice<'a>,
         tcph: etherparse::TcpHeaderSlice<'a>,
-        data: &'a [u8],
     ) -> io::Result<Option<Self>> {
-        let buf = [0u8; 1500];
+        // RFC 793 Page 65: Event processing - SEGMENT ARRIVES
+        //   third check for a SYN
         if !tcph.syn() {
             // only expected SYN package
             return Ok(None);
         }
 
+        // RFC 793 Page 27 - Initial Sequence Number Selection
         let iss = 0;
         let wnd = 1024;
         let mut c = Connection {
@@ -164,6 +172,9 @@ impl Connection {
             },
             state: State::SynRcvd,
             send: SendSequenceSpace {
+                // RFC 793 Page 66
+                // SND.NXT is set to ISS+1 and SND.UNA to ISS
+                // SND.NXT = ISS+1, 在 write 中判断为 SYN 时，进行 +1
                 iss,
                 una: iss,
                 nxt: iss,
@@ -174,12 +185,15 @@ impl Connection {
                 wl2: 0,
             },
             recv: RecvSequenceSpace {
-                nxt: tcph.sequence_number() + 1,
+                // RFC 793 Page 66
+                // Set RCV.NXT to SEG.SEQ+1, IRS is set to SEG.SEQ
+                nxt: tcph.sequence_number().wrapping_add(1),
                 wnd: tcph.window_size(),
                 irs: tcph.sequence_number(),
 
                 up: false,
             },
+            // 看一下 etherparse crate 文档
             ip: etherparse::Ipv4Header::new(
                 0,
                 64,
@@ -207,6 +221,12 @@ impl Connection {
         };
 
         // need to start establishing a connection
+        // 接收到 SYN
+        // 状态转移: LISTEN --> SYN-RECEIVED
+        // 发送 SYN + ACK
+        // RFC 793 Page 66
+        // ISS should be selected and a SYN segment sent of the form:
+        //   <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
         c.tcp.ack = true;
         c.tcp.syn = true;
 
@@ -214,12 +234,17 @@ impl Connection {
         Ok(Some(c))
     }
 
+    /// 发送数据到对端，由于我们实现的是 Server，因此这里是 Server 往 Client 写
+    /// seq -- 发送端的序列号
+    /// limit -- 期望发送的字节长度，实际发送的数据 <= limit
     fn write(&mut self, nic: &mut tun_tap::Iface, seq: u32, mut limit: usize) -> io::Result<usize> {
         let mut buf = [0u8; 1500];
+        // RFC 793 Page 66
+        // if the state is Listen then, s SYN segment sent of the form:
+        //   <SEQ=ISS><ACK=RCV.NXT><CTL=SYN,ACK>
         self.tcp.sequence_number = seq;
         self.tcp.acknowledgment_number = self.recv.nxt;
 
-        // TODO: return +1 for SYN/FIN
         println!(
             "write(ack: {}, seq: {}, limit: {}) syn {:?} fin {:?}",
             self.recv.nxt - self.recv.irs,
@@ -232,6 +257,7 @@ impl Connection {
         // we want self.unacked[nunacked..]
         // we need to special-case the two "virtual" bytes SYN and FIN
         let mut offset = seq.wrapping_sub(self.send.una) as usize;
+        // TODO: close_at 是什么时候更新的呢？
         if let Some(close_at) = self.closed_at {
             if seq == close_at.wrapping_add(1) {
                 // trying to write the following FIN
@@ -247,6 +273,8 @@ impl Connection {
             self.unacked.as_slices()
         );
 
+        // 由于使用了 VecDeque，为环形缓冲区，因此需要将 head 和 tail 进行分别判断
+        // 看一看标准库 VecDeque 的 API 文档
         let (mut head, mut tail) = self.unacked.as_slices();
         if head.len() >= offset {
             head = &head[offset..];
@@ -259,7 +287,7 @@ impl Connection {
         let max_data = std::cmp::min(limit, head.len() + tail.len());
         let size = std::cmp::min(
             buf.len(),
-            self.tcp.header_len() as usize + self.ip.header_len() as usize + max_data,
+            self.ip.header_len() as usize + self.tcp.header_len() as usize + max_data,
         );
 
         self.ip
@@ -274,10 +302,9 @@ impl Connection {
 
         // postpone writing the tcp header because we need the payloads
         // as one contiguous slice to calculate the tcp checksum
+        // 占位，保留 TCP header 的位置
         unwritten = &mut unwritten[self.tcp.header_len() as usize..];
         let tcp_header_ends_at = buf_len - unwritten.len();
-
-        self.tcp.write(&mut unwritten);
 
         // write out the payload
         let payload_bytes = {
@@ -336,6 +363,7 @@ impl Connection {
         // The connection remains in the same state.
         //
         // TODO: handle synchronized RST
+        // RFC 793 Page 37
         // 3.  If the connection is in a synchronized state (ESTABLISHED,
         // FIN-WAIT-1, FIN-WAIT-2, CLOSE-WAIT, CLOSING, LAST-ACK, TIME-WAIT),
         // any unacceptable segment (out of window sequence number or
@@ -350,6 +378,7 @@ impl Connection {
         Ok(())
     }
 
+    // TODO: on_tick 要解决什么问题？
     pub(crate) fn on_tick<'a>(&mut self, nic: &mut tun_tap::Iface) -> io::Result<()> {
         // we have shutdown our write side and the other side acked, no need to (re)transmit anything
         if let State::FinWait2 | State::TimeWait = self.state {
@@ -370,6 +399,7 @@ impl Connection {
             .next()
             .map(|t| t.1.elapsed());
 
+        // (RFC 793 Page 41) Retransmission Timeout
         let should_retransmit = if let Some(waited_for) = waited_for {
             waited_for > time::Duration::from_secs(1)
                 && waited_for.as_secs_f64() > 1.5 * self.timers.srtt
@@ -411,6 +441,8 @@ impl Connection {
         Ok(())
     }
 
+    // RFC 793 Page 69
+    // SEGMENT ARRIVES, Otherwise, ...
     pub(crate) fn on_packet<'a>(
         &mut self,
         nic: &mut tun_tap::Iface,
@@ -418,31 +450,57 @@ impl Connection {
         tcph: etherparse::TcpHeaderSlice<'a>,
         data: &'a [u8],
     ) -> io::Result<Available> {
-        // first, check that sequence numbers are valid (RFC 793 S3.3)
+        // first, check that sequence numbers are valid (RFC 793 S3.3 Page 25 - 26)
         //
-        // valid segment check. okey if it acks at least one byte, which means that at least
+        // valid segment check. okay if it acks at least one byte, which means that at least
         // one of the following is true:
         //   - RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
         //   - RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
         //
+        // SEG.SEQ = first sequence number occupied by the incoming segment
         let seqn = tcph.sequence_number();
+
+        // (RFC 793 Page 25)
+        // SEG.LEN = the number of octets occupied by the data in the segment (counting SYN and FIN)
         let mut slen = data.len() as u32;
         if tcph.fin() || tcph.syn() {
             slen += 1;
         }
+
+        // (RFC 793 Page 69, 变量定义在 Page 25)
+        //
+        // There are four cases for the acceptability test for an incoming
+        // segment:
+        //
+        // Segment Receive  Test
+        // Length  Window
+        // ------- -------  -------------------------------------------
+        //
+        //    0       0     SEG.SEQ = RCV.NXT
+        //
+        //    0      >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+        //
+        //   >0       0     not acceptable
+        //
+        //   >0      >0     RCV.NXT =< SEG.SEQ < RCV.NXT+RCV.WND
+        //               or RCV.NXT =< SEG.SEQ+SEG.LEN-1 < RCV.NXT+RCV.WND
+
+        // (RFC 793 Page 25)
+        // RCV.NXT+RCV.WND-1 = last sequence number expected on an incoming
+        //     segment, and is the right or upper edge of the receive window
         let wend = self.recv.nxt.wrapping_add(self.recv.wnd as u32);
         let okay = if slen == 0 {
             // zero-length segment has separate rules for acceptance
             if self.recv.wnd == 0 {
-                if seqn != self.recv.nxt {
-                    false
-                } else {
+                if seqn == self.recv.nxt {
                     true
+                } else {
+                    false
                 }
-            } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend) {
-                false
-            } else {
+            } else if is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend) {
                 true
+            } else {
+                false
             }
         } else {
             if self.recv.wnd == 0 {
@@ -450,7 +508,7 @@ impl Connection {
             } else if !is_between_wrapped(self.recv.nxt.wrapping_sub(1), seqn, wend)
                 && !is_between_wrapped(
                     self.recv.nxt.wrapping_sub(1),
-                    seqn.wrapping_add(slen - 1),
+                    seqn.wrapping_add(slen).wrapping_sub(1),
                     wend,
                 )
             {
@@ -462,18 +520,26 @@ impl Connection {
 
         if !okay {
             eprintln!("NOT OKAY");
+            // RFC 793 Page 69, first check ... 后半部分
+            // If an incoming segment is not acceptable, an acknowledgment
+            // should be sent in reply (unless the RST bit is set, if so drop
+            // the segment and return):
+            //
+            //   <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+            //
+            // After sending the acknowledgment, drop the unacceptable segment
+            // and return.
             self.write(nic, self.send.nxt, 0)?;
             return Ok(self.availability());
         }
 
-        // TODO: make sure this get acked
-
-        // RFC 793 Page 68 SEGMENT ARRIVES
-        // TODO: if _not_ acceptable, send ACK
-        // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
-
+        // RFC 793 Page 72, fifth check the ACK field
+        // if the ACK bit is off drop the segment and return
         if !tcph.ack() {
             eprintln!("NOT ACK");
+            // RFC 793 Page 71, fourt check the SYN bit
+            //
+            // TODO: 按照 RFC 的说明，这里接收到 SYN 是一个 error，为什么这里还需要这样进行处理呢？
             if tcph.syn() {
                 // got SYN part of initial handshake
                 assert!(data.is_empty());
@@ -483,6 +549,11 @@ impl Connection {
         }
 
         let ackn = tcph.acknowledgment_number();
+        // RFC 793 Page 72, fifth check the ACK field
+        //
+        // SYN-RECEIVED STATE
+        //   If SND.UNA =< SEG.ACK =< SND.NXT then enter ESTABLISHED state
+        //   and continue processing.
         if let State::SynRcvd = self.state {
             if is_between_wrapped(
                 self.send.una.wrapping_sub(1),
@@ -493,22 +564,23 @@ impl Connection {
                 // and we have only sent only one byte (the SYN)
                 self.state = State::Estab;
             } else {
-                // TODO: <SEQ=SEG.ACK><CTL=RST> Page 71
+                // TODO: <SEQ=SEG.ACK><CTL=RST> Page 72
             }
         }
 
+        // ESTABLISHED STATE
+        // FIN-WAIT-1 STATE - In addition to the processing for the ESTABLISHED state
+        // FIN-WAIT-2 STATE
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+            // If SND.UNA < SEG.ACK =< SND.NXT then, set SND.UNA <- SEG.ACK.
             if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-                // if !self.state.is_synchronized() {
-                //     // RFC 793 S3.4 Page 35
-                //     // according to Reset Generation, we should send a RST
-                //     self.send_rst(nic)?;
-                // }
                 println!(
                     "ack for {} (last: {}); prune in {:?}",
                     ackn, self.send.una, self.unacked
                 );
+
                 if !self.unacked.is_empty() {
+                    // 删除已经 ack 的部分
                     let data_start = if self.send.una == self.send.iss {
                         // send.una hasn't been updated yet with ACK for our SYN, so data starts just beyond it
                         self.send.una.wrapping_add(1)
@@ -519,6 +591,7 @@ impl Connection {
                         std::cmp::min(ackn.wrapping_sub(data_start) as usize, self.unacked.len());
                     self.unacked.drain(..acked_data_end);
 
+                    // TODO: 未理解这一部分内容
                     let una = self.send.una;
                     let srtt = &mut self.timers.srtt;
                     self.timers.send_times.retain(|&seq, sent| {
@@ -531,6 +604,7 @@ impl Connection {
                     });
                 }
 
+                // update SND.UNA <- SEG.ACK
                 self.send.una = ackn;
             }
 
@@ -550,8 +624,15 @@ impl Connection {
             }
         }
 
+        // RFC 793 Page 72, seventh process the segment text
+        //
+        // ESTABLISHED STATE
+        // FIN-WAIT-1 STATE
+        // FIN-WAIT-2 STATE
         if data.is_empty() {
             if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+                // Once in the ESTABLISHED state, it is possible to deliver segment
+                // tex to user RECEIVE buffers.
                 let mut unread_data_at = self.recv.nxt.wrapping_sub(seqn) as usize;
                 if unread_data_at > data.len() {
                     // we must have received a re-transmitted FIN that we have already seen,
@@ -567,14 +648,26 @@ impl Connection {
                 // RCV.NXT and RCV.WND should not be reduced.
                 self.recv.nxt = seqn.wrapping_add(data.len() as u32);
 
-                // Send an acknowledgment of the form: <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                // Send an acknowledgment of the form:
+                //   <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
+                //
                 // TODO: maybe just tick to piggyback ack on data
+                // This acknowledgment should be piggybacked on a segment being
+                // transmitted if possible without incurring undue delay.
                 self.write(nic, self.send.nxt, 0)?;
             }
         }
 
+        // RFC 793 Page 75, eighth check the FIN bit
+        //
+        // If the FIN bit is set, signal the user "connection closing" and
+        // return any pending RECEIVEs with same message, advance RCV.NXT
+        // over the FIN, and send an acknowledgment for the FIN.  Note that
+        // FIN implies PUSH for any segment text not yet delivered to the
+        // user.
         if tcph.fin() {
-            eprintln!("IS FIN (in {:?})", self.state);
+            // TODO: 测试的时候注意看一下这里，是否有其他的 state 进入
+            eprintln!("IS FIN (in {:?}) --", self.state);
             match self.state {
                 State::FinWait2 => {
                     // we're done with the connection!

@@ -123,7 +123,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
                                 // TODO: compare before/after
                                 drop(cmg);
                                 if a.contains(tcp::Available::READ) {
-                                    eprintln!("NOT AVAILABILE FOR READ");
+                                    eprintln!("AVAILABILE FOR READ");
                                     ih.rcv_var.notify_all();
                                 }
                                 if a.contains(tcp::Available::WRITE) {
@@ -134,11 +134,11 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
                                 if let Some(pending) = cm.pending.get_mut(&tcph.destination_port())
                                 {
                                     eprintln!("listening, so accepting");
+                                    // 在当前 Quad 上没有已经创建的 Connection
                                     if let Some(c) = tcp::Connection::accept(
                                         &mut nic,
                                         iph,
-                                        tcph,
-                                        &buf[datai..nbytes],
+                                        tcph
                                     )? {
                                         e.insert(c);
                                         pending.push_back(q);
